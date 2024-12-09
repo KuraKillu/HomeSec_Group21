@@ -63,20 +63,35 @@ private:
 };
 
 BH1750 lightMeter(0x23);
+const int systemPin = 5;
+const int luxThreshold = 10;
+
 float luxValue = 0.0;
 
 TaskHandle_t TaskReadLuxHandle;
+TaskHandle_t TaskControlSystemHandle;
 
 void TaskReadLux(void *pvParameters) {
   for (;;) {
     luxValue = lightMeter.readLightLevel(true);
-    if (luxValue >= 0) {
-      Serial.print("Lux: ");
-      Serial.println(luxValue);
-    } else {
-      Serial.println("Failed to read lux value");
-    }
+    Serial.print("Lux: ");
+    Serial.println(luxValue);
     vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+
+void TaskControlSystem(void *pvParameters) {
+  for (;;) {
+    if (luxValue >= 0) { 
+      if (luxValue < luxThreshold) {
+        digitalWrite(systemPin, HIGH);
+        Serial.println("System ON");
+      } else {
+        digitalWrite(systemPin, LOW);
+        Serial.println("System OFF");
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(500)); 
   }
 }
 
@@ -85,15 +100,13 @@ void setup() {
   
   Wire.begin(32, 33);
 
-  if (lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE)) {
-    Serial.println("BH1750 initialized successfully");
-  } else {
-    Serial.println("Failed to initialize BH1750");
-  }
-
+  lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
   lightMeter.setTimeout(200);
 
+  pinMode(systemPin, OUTPUT);
+
   xTaskCreate(TaskReadLux, "TaskReadLux", 2048, NULL, 1, &TaskReadLuxHandle);
+  xTaskCreate(TaskControlSystem, "TaskControlSystem", 2048, NULL, 1, &TaskControlSystemHandle);
 }
 
 void loop() {
