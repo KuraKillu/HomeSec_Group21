@@ -19,6 +19,8 @@
 #include <SPIFFS.h>
 #include <StringArray.h>
 #include <WiFi.h>
+#include <Ticker.h>
+#include <PubSubClient.h>
 
 char auth[] = BLYNK_AUTH_TOKEN;
 char ssid[] = "Kura";
@@ -54,6 +56,16 @@ void capturePhotoSaveSpiffs(void);
 
 boolean takeNewPhoto = false;
 
+// MQTT broker details
+const char* mqtt_server = "broker.hivemq.com";
+const int mqtt_port = 1883;
+const char* light_topic = "home/sensors/light";
+const char* reed_topic = "home/sensors/reed";
+
+// MQTT client
+WiFiClient espClient;
+PubSubClient client(espClient);
+
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE HTML><html>
 <head>
@@ -86,17 +98,69 @@ const char index_html[] PROGMEM = R"rawliteral(
 </body>
 </html>)rawliteral";
 
+Ticker photoTicker;
+
+void capturePhoto() {
+  capturePhotoSaveSpiffs();
+}
+
+// Function to connect to MQTT broker
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    if (client.connect("ESP32CamClient")) {
+      Serial.println("connected");
+      client.subscribe(light_topic);
+      client.subscribe(reed_topic);
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 5 seconds");
+      delay(5000);
+    }
+  }
+}
+
+// Callback function for MQTT messages
+void callback(char* topic, byte* payload, unsigned int length) {
+  String message;
+  for (unsigned int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  Serial.print("Message arrived [");
+  Serial.print(topic);
+  Serial.print("] ");
+  Serial.println(message);
+
+  if (String(topic) == light_topic) {
+    Serial.print("Light level: ");
+    Serial.println(message);
+  } else if (String(topic) == reed_topic) {
+    Serial.print("Reed switch status: ");
+    Serial.println(message);
+    if (message == "triggered") {
+      capturePhotoSaveSpiffs();
+    }
+  }
+}
+
 void setup() {
+  // Turn-off the 'brownout detector' at the beginning
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+  delay(100);
+
   // Serial port for debugging purposes
   Serial.begin(115200);
   delay(500);
 
   Blynk.begin(auth, ssid, pass);
   // Wait for connection
+  Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
+  Serial.println(" connected");
 
   if (!SPIFFS.begin(true)) {
     Serial.println("An Error has occurred while mounting SPIFFS");
@@ -113,9 +177,6 @@ void setup() {
   // Configure the LED pin as an output and turn it off initially
   pinMode(ledPin, OUTPUT);
   digitalWrite(ledPin, LOW); // LED is off initially
-
-  // Turn-off the 'brownout detector'
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
 
   // OV2640 camera module
   camera_config_t config;
@@ -182,12 +243,22 @@ void setup() {
 
   // Start the server
   server.begin();
+  Serial.println("HTTP server started");
+
+  // Set up a ticker to capture a photo every 5 seconds
+  photoTicker.attach(5, capturePhoto);
+
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(callback);
 }
 
 void loop() {
-  // Capture and save a new photo every loop
-  capturePhotoSaveSpiffs();
-  delay(5000); // Wait 5 seconds before capturing the next photo
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+  Blynk.run();
+  // ...existing code...
 }
 
 // Check if photo capture was successful

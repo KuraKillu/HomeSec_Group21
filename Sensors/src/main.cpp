@@ -1,6 +1,8 @@
 #include "freertos/FreeRTOS.h"
 #include <BH1750.h>
 #include <Wire.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
 
 // Default I2C address (use 0x5C if scanner detects it)
 BH1750 lightMeter(0x23);
@@ -16,9 +18,25 @@ TaskHandle_t reedSwitchTaskHandle = NULL;
 // Variables
 float lux = 0; // Light sensor value
 
+// WiFi credentials
+const char* ssid = "your_SSID";
+const char* password = "your_PASSWORD";
+
+// MQTT broker details
+const char* mqtt_server = "broker.hivemq.com";
+const int mqtt_port = 1883;
+const char* light_topic = "home/sensors/light";
+const char* reed_topic = "home/sensors/reed";
+
+// MQTT client
+WiFiClient espClient;
+PubSubClient client(espClient);
+
 // Functions
 void lightSensorTask(void *parameter);
 void reedSwitchTask(void *parameter);
+void setup_wifi();
+void reconnect();
 
 void setup() {
   // Initialize serial communication
@@ -44,9 +62,16 @@ void setup() {
               1,                     // Priority
               &reedSwitchTaskHandle  // Task handle
   );
+
+  setup_wifi();
+  client.setServer(mqtt_server, mqtt_port);
 }
 
 void loop() {
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
   // Leave empty as FreeRTOS tasks handle everything
 }
 
@@ -72,6 +97,7 @@ void lightSensorTask(void *parameter) {
       Serial.print("Light: ");
       Serial.print(lux);
       Serial.println(" lx");
+      client.publish(light_topic, String(lux).c_str());
     }
     vTaskDelay(pdMS_TO_TICKS(1000)); // Delay 1 second
   }
@@ -88,8 +114,10 @@ void reedSwitchTask(void *parameter) {
       if (digitalRead(REED_SWITCH_PIN) == LOW) {
         digitalWrite(BUZZER_PIN, HIGH); // Turn on the buzzer
         Serial.println("Reed switch triggered!");
+        client.publish(reed_topic, "triggered");
       } else {
         digitalWrite(BUZZER_PIN, LOW); // Turn off the buzzer
+        client.publish(reed_topic, "not triggered");
       }
     } else {
       digitalWrite(
@@ -97,5 +125,40 @@ void reedSwitchTask(void *parameter) {
           LOW); // Turn off the buzzer if light level is above threshold
     }
     vTaskDelay(pdMS_TO_TICKS(100)); // Delay to yield control (100ms)
+  }
+}
+
+// Function to connect to WiFi
+void setup_wifi() {
+  delay(10);
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
+// Function to connect to MQTT broker
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    if (client.connect("ESP32Client")) {
+      Serial.println("connected");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 5 seconds");
+      delay(5000);
+    }
   }
 }
