@@ -1,17 +1,26 @@
 #include "freertos/FreeRTOS.h"
 #include <BH1750.h>
 #include <Wire.h>
+#include <painlessMesh.h>
 
 // Default I2C address (use 0x5C if scanner detects it)
 BH1750 lightMeter(0x23);
 
+painlessMesh mesh;
+
 // Task handles
 TaskHandle_t lightSensorTaskHandle = NULL;
 TaskHandle_t reedSwitchTaskHandle = NULL;
+TaskHandle_t meshUpdateTaskHandle;
 
 // Pin definitions
 #define REED_SWITCH_PIN 15 // GPIO pin connected to the reed switch
 #define BUZZER_PIN 26      // GPIO pin connected to the buzzer
+
+// Mesh network parameters
+#define MESH_PREFIX "Kelompok21"
+#define MESH_PASSWORD "bangRianGanteng"
+#define MESH_PORT 5555
 
 // Variables
 float lux = 0; // Light sensor value
@@ -19,6 +28,8 @@ float lux = 0; // Light sensor value
 // Functions
 void lightSensorTask(void *parameter);
 void reedSwitchTask(void *parameter);
+void receivedCallback(uint32_t from, String &msg);
+void meshUpdateTask(void *parameter);
 
 void setup() {
   // Initialize serial communication
@@ -26,6 +37,11 @@ void setup() {
 
   // Initialize the I2C bus
   Wire.begin(21, 22); // For ESP32: SDA = GPIO 21, SCL = GPIO 22
+
+  // Initialize mesh network
+  mesh.setDebugMsgTypes(ERROR | STARTUP | CONNECTION); // Debug message types
+  mesh.init(MESH_PREFIX, MESH_PASSWORD, MESH_PORT);
+  mesh.onReceive(&receivedCallback); // Register the message receive callback
 
   // Create the FreeRTOS task for light sensor reading
   xTaskCreate(lightSensorTask,       // Task function
@@ -44,11 +60,18 @@ void setup() {
               1,                     // Priority
               &reedSwitchTaskHandle  // Task handle
   );
+
+  // Create FreeRTOS task for updating mesh
+  xTaskCreate(meshUpdateTask,       // Function to implement the task
+              "MeshUpdateTask",     // Task name
+              8192,                 // Stack size
+              NULL,                 // Task input parameter
+              3,                    // Priority
+              &meshUpdateTaskHandle // Task handle
+  );
 }
 
-void loop() {
-  // Leave empty as FreeRTOS tasks handle everything
-}
+void loop() {}
 
 // Task to read the light sensor
 void lightSensorTask(void *parameter) {
@@ -84,7 +107,7 @@ void reedSwitchTask(void *parameter) {
 
   while (1) {
     // Check if light level is below the threshold
-    if (lux <= 15 ) {
+    if (lux <= 15) {
       if (digitalRead(REED_SWITCH_PIN) == LOW) {
         digitalWrite(BUZZER_PIN, HIGH); // Turn on the buzzer
         Serial.println("Reed switch triggered!");
@@ -97,5 +120,18 @@ void reedSwitchTask(void *parameter) {
           LOW); // Turn off the buzzer if light level is above threshold
     }
     vTaskDelay(pdMS_TO_TICKS(100)); // Delay to yield control (100ms)
+  }
+}
+
+// Function to handle received messages
+void receivedCallback(uint32_t from, String &msg) {
+  Serial.printf("Received message from node %u: %s\n", from, msg.c_str());
+}
+
+// Task to continuously update the mesh network
+void meshUpdateTask(void *pvParameters) {
+  while (true) {
+    mesh.update();
+    vTaskDelay(10 / portTICK_PERIOD_MS); // Short delay to yield to other tasks
   }
 }

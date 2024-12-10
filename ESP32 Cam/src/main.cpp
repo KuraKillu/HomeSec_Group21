@@ -15,10 +15,9 @@
 #include "soc/soc.h"          // Disable brownour problems
 #include <BlynkSimpleEsp32.h>
 #include <ESPAsyncWebServer.h>
-#include <FS.h>
-#include <SPIFFS.h>
 #include <StringArray.h>
 #include <WiFi.h>
+#include <painlessMesh.h>
 
 char auth[] = BLYNK_AUTH_TOKEN;
 char ssid[] = "Kura";
@@ -42,6 +41,13 @@ char pass[] = "supacabra12";
 #define HREF_GPIO_NUM 23
 #define PCLK_GPIO_NUM 22
 
+// Select camera model
+// #define CAMERA_MODEL_WROVER_KIT
+// #define CAMERA_MODEL_ESP_EYE
+// #define CAMERA_MODEL_M5STACK_PSRAM
+// #define CAMERA_MODEL_M5STACK_WIDE
+#define CAMERA_MODEL_AI_THINKER
+
 // Create AsyncWebServer object on port 80
 AsyncWebServer server(80);
 
@@ -55,11 +61,12 @@ void capturePhotoSaveSpiffs(void);
 boolean takeNewPhoto = false;
 
 const char index_html[] PROGMEM = R"rawliteral(
-<!DOCTYPE HTML><html>
+<!DOCTYPE HTML>
+<html>
 <head>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
-    body { text-align:center; font-family: Arial, sans-serif; }
+    body { text-align: center; font-family: Arial, sans-serif; }
     img { margin-top: 20px; max-width: 90%; height: auto; }
   </style>
   <script>
@@ -76,48 +83,47 @@ const char index_html[] PROGMEM = R"rawliteral(
         console.error('Error checking for new photo:', error);
       }
     }
-    // Periodically check for a new photo every second
+
+    // Periodically check for a new photo every 5 seconds
     setInterval(checkForNewPhoto, 5000);
   </script>
 </head>
 <body>
-  <h2>This is the invader photo</h2>
-  <img src="saved-photo" alt="Captured Photo">
+  <h2>Live Photo Viewer</h2>
+  <p>The image below will update automatically when a new photo is taken.</p>
+  <img src="/saved-photo" alt="Captured Photo">
 </body>
-</html>)rawliteral";
+</html>
+)rawliteral";
 
 void setup() {
+  // Turn-off the 'brownout detector'
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+  delay(100);
+
   // Serial port for debugging purposes
   Serial.begin(115200);
   delay(500);
 
+  // Connect to Wi-Fi
   Blynk.begin(auth, ssid, pass);
-  // Wait for connection
+  Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
-
-  if (!SPIFFS.begin(true)) {
-    Serial.println("An Error has occurred while mounting SPIFFS");
-    ESP.restart();
-  } else {
-    delay(500);
-    Serial.println("SPIFFS mounted successfully");
-  }
-
-  // Print ESP32 Local IP Address
+  Serial.println("\nWiFi connected");
   Serial.print("IP Address: http://");
   Serial.println(WiFi.localIP());
 
-  // Configure the LED pin as an output and turn it off initially
-  pinMode(ledPin, OUTPUT);
-  digitalWrite(ledPin, LOW); // LED is off initially
+  // Initialize SPIFFS
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS mount failed");
+    ESP.restart();
+  }
+  Serial.println("SPIFFS mounted successfully");
 
-  // Turn-off the 'brownout detector'
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
-
-  // OV2640 camera module
+  // Camera Configuration
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -140,96 +146,107 @@ void setup() {
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
 
-  // Configure frame size, quality, and buffer count based on PSRAM availability
   if (psramFound()) {
-    config.frame_size = FRAMESIZE_UXGA;
-    config.jpeg_quality = 10;
-    config.fb_count = 2;
+    config.frame_size = FRAMESIZE_SVGA; // Moderate resolution
+    config.jpeg_quality = 12;           // Lower quality, faster capture
+    config.fb_count = 2;                // Double buffer for PSRAM
   } else {
-    config.frame_size = FRAMESIZE_SVGA;
-    config.jpeg_quality = 12;
+    config.frame_size = FRAMESIZE_VGA; // Low resolution for stability
+    config.jpeg_quality = 15;
     config.fb_count = 1;
   }
 
-  // Camera init
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("Camera init failed with error 0x%x", err);
     ESP.restart();
   }
+  Serial.println("Camera initialized successfully");
 
-  // Endpoint to serve the main webpage
+  // Configure LED pin
+  pinMode(ledPin, OUTPUT);
+  digitalWrite(ledPin, LOW);
+
+  // Start Web Server
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send_P(200, "text/html", index_html);
   });
-
-  // Endpoint to serve the latest photo
   server.on("/saved-photo", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (SPIFFS.exists(FILE_PHOTO)) {
       request->send(SPIFFS, FILE_PHOTO, "image/jpeg");
     } else {
-      request->send(404, "text/plain", "Photo not found");
+      request->send(404, "Photo not found");
     }
   });
-
-  // Endpoint to check if a new photo is available
   server.on("/check-photo", HTTP_GET, [](AsyncWebServerRequest *request) {
     String jsonResponse =
-        String("{\"newPhoto\":") + (takeNewPhoto ? "true" : "false") + "}";
-    takeNewPhoto = false; // Reset the flag after sending the response
+        "{\"newPhoto\":" + String(takeNewPhoto ? "true" : "false") + "}";
+    takeNewPhoto = false;
     request->send(200, "application/json", jsonResponse);
   });
-
-  // Start the server
   server.begin();
+  Serial.println("Server started");
 }
 
 void loop() {
-  // Capture and save a new photo every loop
-  capturePhotoSaveSpiffs();
-  delay(5000); // Wait 5 seconds before capturing the next photo
+  // Trigger photo capture every 5 seconds
+  static unsigned long lastCapture = 0;
+  unsigned long currentMillis = millis();
+
+  if (currentMillis - lastCapture >= 10000) { // 5 seconds interval
+    lastCapture = currentMillis;
+    capturePhotoSaveSpiffs();
+  }
+
+  Blynk.run(); // Keep Blynk connection alive
 }
 
 // Check if photo capture was successful
 bool checkPhoto(fs::FS &fs) {
   File f_pic = fs.open(FILE_PHOTO);
+  if (!f_pic) {
+    Serial.println("Failed to open photo file for verification");
+    return false;
+  }
   unsigned int pic_sz = f_pic.size();
-  return (pic_sz > 100);
+  f_pic.close();
+  return (pic_sz > 100); // Ensure the photo file is not empty
 }
 
 // Capture Photo and Save it to SPIFFS
 void capturePhotoSaveSpiffs(void) {
   camera_fb_t *fb = NULL;
-  bool ok = false;
 
-  do {
-    // Turn on the LED before taking a photo
-    digitalWrite(ledPin, HIGH);
+  // Turn on the LED before taking a photo
+  digitalWrite(ledPin, HIGH);
 
-    // Take a photo
-    fb = esp_camera_fb_get();
-    if (!fb) {
-      Serial.println("Camera capture failed");
-      digitalWrite(ledPin, LOW);
-      return;
-    }
-
-    // Save the captured photo
-    File file = SPIFFS.open(FILE_PHOTO, FILE_WRITE);
-    if (file) {
-      file.write(fb->buf, fb->len);
-      file.close();
-      takeNewPhoto =
-          true; // Set the flag to indicate a new photo is available
-      Serial.println("Photo saved successfully.");
-    } else {
-      Serial.println("Failed to save photo.");
-    }
-
-    // Clean up
-    esp_camera_fb_return(fb);
+  // Take a photo
+  fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Camera capture failed");
     digitalWrite(ledPin, LOW);
+    return;
+  }
 
-    ok = checkPhoto(SPIFFS);
-  } while (!ok);
+  // Save the captured photo
+  File file = SPIFFS.open(FILE_PHOTO, FILE_WRITE);
+  if (file) {
+    file.write(fb->buf, fb->len);
+    file.close();
+    takeNewPhoto = true; // Indicate a new photo is available
+    Serial.println("Photo saved successfully");
+  } else {
+    Serial.println("Failed to save photo");
+  }
+
+  // Clean up
+  esp_camera_fb_return(fb);
+  digitalWrite(ledPin, LOW);
+
+  // Verify the saved photo
+  if (!checkPhoto(SPIFFS)) {
+    Serial.println("Photo verification failed");
+  } else {
+    Serial.println("Photo verified successfully");
+  }
 }
